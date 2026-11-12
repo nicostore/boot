@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # =====================================================================
-# boot.sh — VPS baru dalam satu perintah (gaya install hermes, tapi RESTORE)
+# boot.sh — VPS baru, sekali jalan, langsung bisa chat lagi di Telegram
 #
-#   bash <(curl -fsSL https://gist.githubusercontent.com/nicostore/<ID>/raw/boot.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/nicostore/boot/main/boot.sh)
 #
-# Alur: pilih mode (hermes+xrouter / root / keduanya) -> pilih sumber archive
-#       (login Google sekali = privat tanpa share, atau tempel link Drive)
-#       -> sistem disiapkan (apt, rclone, hermes) -> archive diunduh
-#       -> restore -> tool + jadwal backup.
+# Urutan otomatis: apt dasar -> rclone -> install Hermes -> unduh archive ->
+#   restore hermes(+xrouter) -> restore root -> tool pendukung -> xrouter hidup
+#   (node_modules + unit systemd + tunnel) -> jadwal backup -> cek kesehatan.
 #
-# Non-interaktif:
-#   bash boot.sh --mode both   --source login
-#   bash boot.sh --mode hermes --link "https://drive.google.com/file/d/<ID>/view"
-#   bash boot.sh --pass 'passku'          # set password root + izinkan ssh password
-#   bash boot.sh --selftest               # uji parser, tidak mengubah sistem
+# Pilihan:
+#   --fast            lewati apt upgrade + setup-tools (paling cepat)
+#   --mode hermes|root|both    --source login|link    --link <url>
+#   --fix-xrouter     hanya siapkan/hidupkan xrouter + tunnel (idempoten, aman diulang)
+#   --dry             bareng --fix-xrouter: cuma melaporkan, tidak mengubah sistem
+#   --selftest        uji parser, tidak mengubah sistem
 # =====================================================================
 set -euo pipefail
 export TZ=Asia/Jakarta
@@ -21,22 +21,117 @@ export HOME="${HOME:-/root}"
 export DEBIAN_FRONTEND=noninteractive
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-# OAuth app: dipakai untuk login device-flow kalau rclone.conf belum ada.
+# OAuth app (dipakai device-flow login kalau rclone.conf belum ada di VPS baru).
 RCLONE_CONF="${RCLONE_CONF:-/root/.config/rclone/rclone.conf}"
 CLIENT_ID="${RCLONE_CLIENT_ID:-134267350051-n9s5vof5287npgq09ou8hq1uo30tsi4e.apps.googleusercontent.com}"
 CLIENT_SECRET="${RCLONE_CLIENT_SECRET:-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}"
 SCOPE="https://www.googleapis.com/auth/drive.file"
 HOURLY_DIR="hermes-backups"
+HERMES_HOME="${HERMES_HOME:-/root/.hermes}"
 
 MODE=""; SOURCE=""; LINK=""; LINK2=""; ROOT_PASS=""
-DO_UPGRADE=1; DO_APT=1; DO_TOOLS=1; DO_CRON=1; TMP_ARCH="/root"
+DO_UPGRADE=1; DO_APT=1; DO_TOOLS=1; DO_CRON=1; FIX_XR=0; DRY=0; TMP_ARCH="/root"
 
 say()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[X]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# ------------------------------------------------- xrouter: node_modules + unit + tunnel
+node_bin() {
+  local n
+  n="$(ls -1 /root/.hermes/tools/node-*/bin/node 2>/dev/null | head -1 || true)"
+  [ -n "$n" ] || n="$(command -v node 2>/dev/null || true)"
+  printf '%s' "$n"
+}
+
+setup_xrouter() {
+  say "xrouter: node_modules + service + tunnel"
+  [ -d /opt/xrouter ] || { warn "/opt/xrouter tidak ada — archive hermes/root belum di-restore?"; return 0; }
+  local node npm_bin
+  node="$(node_bin)"
+  if [ -z "$node" ]; then
+    warn "node belum ada — jalankan dulu: bash /root/hermes-backup/setup-tools.sh, lalu: boot.sh --fix-xrouter"
+    return 1
+  fi
+  echo "   node: $node ($("$node" -v 2>/dev/null))"
+
+  if [ -d /opt/xrouter/node_modules ]; then
+    echo "   node_modules: sudah ada — dilewati"
+  elif [ "$DRY" = "1" ]; then
+    echo "   [dry] akan jalankan: npm install --omit=dev di /opt/xrouter"
+  else
+    npm_bin="$(dirname "$node")/npm"; [ -x "$npm_bin" ] || npm_bin="$(command -v npm || true)"
+    if [ -z "$npm_bin" ]; then warn "npm tidak ketemu di samping node"; return 1; fi
+    if ( cd /opt/xrouter && "$npm_bin" install --omit=dev --no-audit --no-fund --loglevel=error ); then
+      echo "   node_modules: terpasang"
+    else
+      warn "npm install gagal — jalankan manual: cd /opt/xrouter && npm install"
+    fi
+  fi
+
+  if [ -f /etc/systemd/system/xrouter.service ]; then
+    if [ "$DRY" = "1" ]; then
+      echo "   [dry] ExecStart xrouter.service -> $node custom-server.js"
+    else
+      sed -i -E "s|^ExecStart=.*node .*custom-server.js|ExecStart=$node custom-server.js|" /etc/systemd/system/xrouter.service
+      systemctl daemon-reload
+      if systemctl enable --now xrouter.service >/dev/null 2>&1; then echo "   service xrouter: aktif"; else warn "service xrouter gagal start"; fi
+    fi
+  else
+    warn "unit /etc/systemd/system/xrouter.service tidak ada (archive hermes belum di-restore?)"
+  fi
+
+  if [ -f /etc/systemd/system/cloudflared-xrouter.service ]; then
+    if ! command -v cloudflared >/dev/null; then
+      if [ "$DRY" = "1" ]; then
+        echo "   [dry] akan install cloudflared ke /usr/local/bin"
+      else
+        curl -fsSL -o /usr/local/bin/cloudflared \
+          https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+          && chmod +x /usr/local/bin/cloudflared && echo "   cloudflared: terpasang"
+      fi
+    fi
+    if [ "$DRY" = "1" ]; then
+      echo "   [dry] akan start cloudflared-xrouter"
+    elif systemctl enable --now cloudflared-xrouter.service >/dev/null 2>&1; then
+      echo "   tunnel xrouter: aktif"
+    else
+      warn "tunnel xrouter gagal start"
+    fi
+  fi
+}
+
+# ------------------------------------------------- cek terakhir: sudah bisa chat lagi?
+final_check() {
+  say "cek terakhir"
+  local gw xr bot
+  gw="$(systemctl --user is-active hermes-gateway 2>/dev/null || systemctl is-active hermes-gateway 2>/dev/null || echo unknown)"
+  echo "   gateway hermes : $gw"
+  xr="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:20128/v1/models 2>/dev/null || echo 000)"
+  echo "   xrouter lokal  : HTTP $xr (port 20128)"
+  [ -f /etc/systemd/system/cloudflared-xrouter.service ] && \
+    echo "   tunnel xrouter : $(systemctl is-active cloudflared-xrouter 2>/dev/null || echo unknown)"
+  bot="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$HERMES_HOME/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"' " || true)"
+  if [ -n "$bot" ]; then
+    curl -s --max-time 10 "https://api.telegram.org/bot${bot}/getMe" 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin); r = d.get('result', {})
+    print('   telegram bot   : @%s (%s)' % (r.get('username'), r.get('first_name')) if d.get('ok') else '   telegram bot   : GAGAL — token tidak valid')
+except Exception:
+    print('   telegram bot   : tidak bisa dicek')
+" 2>/dev/null || echo "   telegram bot   : tidak bisa dicek"
+  fi
+  echo
+  if [ "$gw" = "active" ]; then
+    echo "   SIAP — kirim pesan ke bot Telegram kamu, sudah nyambung."
+  else
+    echo "   Gateway belum active: systemctl --user status hermes-gateway"
+  fi
+}
+
 # ---------------------------------------------------------------- parser link Drive
-drive_id() { # cetak ID untuk link Google Drive / ID mentah; gagal -> exit 1
+drive_id() {
   local s="$1"
   case "$s" in
     *drive.google.com/file/d/*) s="${s#*file/d/}"; printf '%s' "${s%%/*}"; return 0 ;;
@@ -70,21 +165,26 @@ while [ $# -gt 0 ]; do
     --link)   LINK="${2:-}"; SOURCE="link"; shift 2 ;;
     --pass)   ROOT_PASS="${2:-}"; shift 2 ;;
     --dest)   TMP_ARCH="${2:-/root}"; shift 2 ;;
+    --fast)   DO_UPGRADE=0; DO_TOOLS=0; shift ;;
+    --fix-xrouter) FIX_XR=1; shift ;;
+    --dry)    DRY=1; shift ;;
     --no-upgrade) DO_UPGRADE=0; shift ;;
     --no-apt)     DO_APT=0; shift ;;
     --no-tools)   DO_TOOLS=0; shift ;;
     --no-cron)    DO_CRON=0; shift ;;
     --selftest) selftest; exit 0 ;;
-    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "argumen tak dikenal: $1 (pakai --help)" ;;
   esac
 done
 
 [ "$(id -u)" = "0" ] || die "jalankan sebagai root"
 
+if [ "$FIX_XR" = "1" ]; then setup_xrouter; final_check; exit 0; fi
+
 # `curl ... | bash` memakai stdin untuk script -> menu tak bisa baca input.
 if [ ! -t 0 ] && [ -z "$MODE" ] && [ -z "$LINK" ]; then
-  exec </dev/tty 2>/dev/null || die "tidak bisa baca input. Pakai: bash <(curl -fsSL <url>)  — atau: --mode … --source login"
+  exec </dev/tty 2>/dev/null || die "tidak bisa baca input. Pakai: bash <(curl -fsSL <url>)  — atau: --mode ... --source login"
 fi
 
 # ---------------------------------------------------------------- menu
@@ -94,9 +194,9 @@ if [ -z "$MODE" ]; then
   ==============================================
    RESTORE VPS BARU   (hermes + xrouter / root)
   ==============================================
-   1) Hermes + xrouter
+   1) Hermes + xrouter   (langsung bisa chat lagi)
    2) /root saja
-   3) Keduanya   (paling sering dipakai)
+   3) Keduanya
    9) Keluar
 BANNER
   printf '  Pilih [1/2/3/9]: '; read -r c
@@ -154,10 +254,11 @@ fi
 if [ "$MODE" != "root" ] && ! command -v hermes >/dev/null; then
   say "install Hermes"
   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+  hash -r 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------- 2. sumber archive
-login_google() { # device flow: user buka link + masukkan kode, tidak perlu paste apa pun
+login_google() { # device flow: buka link + masukkan kode, tidak perlu paste apa pun
   local resp dcode ucode vurl interval tok rt at exp err
   say "login Google — buka link di bawah, masukkan kode, setujui"
   mkdir -p "$(dirname "$RCLONE_CONF")"; chmod 700 "$(dirname "$RCLONE_CONF")"
@@ -194,19 +295,19 @@ PY
       authorization_pending|slow_down|"") printf '   menunggu persetujuan...\n' ;;
       access_denied) die "login ditolak di browser" ;;
       expired_token) die "kode kedaluwarsa — jalankan ulang" ;;
-      *) die "login gagal ($err). Kalau ini VPS baru, pakai opsi 2 (tempel link) atau login rclone manual." ;;
+      *) die "login gagal ($err). Pakai opsi 2 (tempel link) atau login rclone manual." ;;
     esac
   done
 }
 
-pull_via_rclone() { # $1 = pola nama archive
+pull_via_rclone() {
   local pat="$1"
   say "unduh archive dari Drive: $pat"
   rclone --config "$RCLONE_CONF" copy "gdrive:$HOURLY_DIR/" "$TMP_ARCH/" \
       --include "$pat" --include "${pat%.tar.gz}.sha256" --stats-one-line 2>&1 | tail -2
 }
 
-pull_via_link() { # $1 = link/URL
+pull_via_link() {
   local link="$1" id
   if id="$(drive_id "$link")"; then
     command -v gdown >/dev/null || { pip3 install -q --break-system-packages gdown 2>/dev/null || pip3 install -q gdown; }
@@ -261,10 +362,14 @@ if [ -n "$R_ARCH" ]; then
   fi
 fi
 
-# ---------------------------------------------------------------- 4. tool + jadwal
+# ---------------------------------------------------------------- 4. tool, xrouter, jadwal
 if [ "$DO_TOOLS" = "1" ] && [ -f /root/hermes-backup/setup-tools.sh ]; then
   say "pasang tool pendukung (nvm/node, python, chrome, camoufox, venv, node_modules)"
   bash /root/hermes-backup/setup-tools.sh || warn "ada bagian setup-tools.sh yang gagal — cek /root/hermes-backup/setup-tools.log"
+fi
+
+if [ -d /opt/xrouter ]; then
+  setup_xrouter || warn "xrouter belum hidup — ulangi: bash boot.sh --fix-xrouter"
 fi
 
 if [ "$DO_CRON" = "1" ] && [ -f /root/hermes-backup/crontab.txt ]; then
@@ -282,17 +387,22 @@ if [ "$DO_CRON" = "1" ] && [ -f /root/hermes-backup/crontab.txt ]; then
   rm -f "$TMPCRON"
 fi
 
+if [ "$MODE" != "root" ] && command -v hermes >/dev/null; then
+  if [ "$(systemctl --user is-active hermes-gateway 2>/dev/null || true)" != "active" ]; then
+    say "start gateway Hermes"
+    systemctl --user start hermes-gateway 2>/dev/null || warn "start gagal — cek: systemctl --user status hermes-gateway"
+  fi
+fi
+
+final_check
+
 cat <<EOF
 
 =====================================================================
- SELESAI
-   mode          : $MODE  (sumber: $SOURCE)
-   archive hermes: ${H_ARCH:-tidak dipakai}
-   archive root  : ${R_ARCH:-tidak dipakai}
-   hermes        : $(command -v hermes >/dev/null && echo terpasang || echo 'BELUM: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash')
-   gateway       : systemctl status hermes-gateway   /   systemctl --user status hermes-gateway
+ SELESAI  (mode=$MODE  sumber=$SOURCE)
+   archive       : $(basename "${H_ARCH:-tidak dipakai}") / $(basename "${R_ARCH:-tidak dipakai}")
+   kurang tool?  : bash /root/hermes-backup/setup-tools.sh   lalu  bash boot.sh --fix-xrouter
    log backup    : tail -f /root/hermes-backup/backup.log
-   kurang tool?  : bash /root/hermes-backup/setup-tools.sh
    hapus archive : rm -f /root/{hermes,root}-backup-*.tar.gz
 =====================================================================
 EOF
