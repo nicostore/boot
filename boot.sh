@@ -55,18 +55,30 @@ setup_xrouter() {
   fi
   echo "   node: $node ($("$node" -v 2>/dev/null))"
 
-  if [ -d /opt/xrouter/node_modules ]; then
-    echo "   node_modules: sudah ada — dilewati"
-  elif [ "$DRY" = "1" ]; then
-    echo "   [dry] akan jalankan: npm install --omit=dev di /opt/xrouter"
-  else
-    npm_bin="$(dirname "$node")/npm"; [ -x "$npm_bin" ] || npm_bin="$(command -v npm || true)"
-    if [ -z "$npm_bin" ]; then warn "npm tidak ketemu di samping node"; return 1; fi
-    if ( cd /opt/xrouter && "$npm_bin" install --omit=dev --no-audit --no-fund --loglevel=error ); then
-      echo "   node_modules: terpasang"
+  npm_bin="$(dirname "$node")/npm"; [ -x "$npm_bin" ] || npm_bin="$(command -v npm || true)"
+  if [ -z "$npm_bin" ]; then warn "npm tidak ketemu di samping node"; return 1; fi
+
+  if [ ! -d /opt/xrouter/node_modules/next/dist/bin ]; then
+    if [ "$DRY" = "1" ]; then echo "   [dry] npm install (PENUH, jangan --omit=dev) di /opt/xrouter"
+    elif ( cd /opt/xrouter && "$npm_bin" install --no-audit --no-fund --loglevel=error ); then
+      echo "   node_modules: terpasang (install penuh)"
     else
-      warn "npm install gagal — jalankan manual: cd /opt/xrouter && npm install"
+      warn "npm install gagal — manual: cd /opt/xrouter && npm install"
     fi
+  else
+    echo "   node_modules: lengkap (next ada) — dilewati"
+  fi
+
+  # .next WAJIB ada: tanpa production build, `next start` gagal -> xrouter crash-loop -> 502 Bad Gateway
+  if [ ! -f /opt/xrouter/.next/BUILD_ID ]; then
+    if [ "$DRY" = "1" ]; then echo "   [dry] npm run build (next build) di /opt/xrouter"
+    elif ( cd /opt/xrouter && "$npm_bin" run build ); then
+      echo "   .next: terbangun"
+    else
+      warn ".next gagal dibangun — xrouter akan crash-loop. Manual: cd /opt/xrouter && npm run build"
+    fi
+  else
+    echo "   .next: sudah ada"
   fi
 
   if [ -f /etc/systemd/system/xrouter.service ]; then
