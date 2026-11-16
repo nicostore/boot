@@ -29,7 +29,7 @@ SCOPE="https://www.googleapis.com/auth/drive.file"
 HOURLY_DIR="hermes-backups"
 HERMES_HOME="${HERMES_HOME:-/root/.hermes}"
 
-MODE=""; SOURCE=""; LINK=""; LINK2=""; ROOT_PASS=""
+MODE=""; SOURCE=""; LINK=""; LINK2=""; ROOT_PASS=""; RESET_STATE=0
 DO_UPGRADE=1; DO_APT=1; DO_TOOLS=1; DO_CRON=1; FIX_XR=0; DRY=0; TMP_ARCH="/root"
 
 say()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
@@ -184,6 +184,7 @@ while [ $# -gt 0 ]; do
     --no-apt)     DO_APT=0; shift ;;
     --no-tools)   DO_TOOLS=0; shift ;;
     --no-cron)    DO_CRON=0; shift ;;
+    --reset-state) RESET_STATE=1; shift ;;
     --selftest) selftest; exit 0 ;;
     -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "argumen tak dikenal: $1 (pakai --help)" ;;
@@ -240,13 +241,34 @@ if [ -z "$ROOT_PASS" ] && [ -t 0 ]; then
 fi
 say "mode=$MODE  sumber=$SOURCE"
 
+# ---------------------------------------------------------------- 0. state resume
+# Langkah berat ditandai selesai -> run ulang setelah gagal tidak meng-install
+# Hermes dua kali dan tidak menimpa restore yang sudah beres.
+STATE_DIR="/root/hermes-backup/.boot-state"; mkdir -p "$STATE_DIR"
+skip_if_done() {
+  [ "$RESET_STATE" = "1" ] && return 1
+  [ -f "$STATE_DIR/$1.done" ] || return 1
+  echo "   SKIP $1 — sudah selesai di run sebelumnya (--reset-state untuk ulangi)"
+  return 0
+}
+mark_done() { : > "$STATE_DIR/$1.done"; }
+hermes_present() {
+  command -v hermes >/dev/null 2>&1 && return 0
+  local p
+  for p in /root/.local/bin/hermes /root/.hermes/bin/hermes /usr/local/bin/hermes; do
+    [ -x "$p" ] && return 0
+  done
+  return 1
+}
+
 # ---------------------------------------------------------------- 1. sistem
-if [ "$DO_APT" = "1" ]; then
+if [ "$DO_APT" = "1" ] && ! skip_if_done apt; then
   say "apt update + paket dasar"
   apt-get update -qq
   apt-get install -y -qq curl ca-certificates unzip git jq sqlite3 python3 python3-pip \
           openssh-client tmux >/dev/null
   if [ "$DO_UPGRADE" = "1" ]; then say "apt upgrade"; apt-get upgrade -y -qq >/dev/null; fi
+  mark_done apt
 fi
 
 if [ -n "$ROOT_PASS" ]; then
@@ -261,12 +283,22 @@ if ! command -v rclone >/dev/null; then
   say "install rclone"
   curl -fsSL https://rclone.org/install.sh -o /tmp/rclone-install.sh
   bash /tmp/rclone-install.sh >/dev/null    # WAJIB bash, bukan sh (dash: Syntax error)
+  command -v rclone >/dev/null || die "rclone gagal terpasang"
 fi
 
-if [ "$MODE" != "root" ] && ! command -v hermes >/dev/null; then
-  say "install Hermes"
-  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-  hash -r 2>/dev/null || true
+if [ "$MODE" != "root" ]; then
+  export PATH="/root/.local/bin:/usr/local/bin:$PATH"
+  if skip_if_done hermes || hermes_present; then
+    echo "   Hermes: sudah terpasang — install dilewati"
+  elif [ "$DRY" = "1" ]; then
+    echo "   [dry] install Hermes"
+  else
+    say "install Hermes (sekali)"
+    curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+    hash -r 2>/dev/null || true
+    hermes_present || die "install selesai tapi binary hermes tak ketemu — cek: ls -l /root/.local/bin"
+    mark_done hermes
+  fi
 fi
 
 # ---------------------------------------------------------------- 2. sumber archive
@@ -359,12 +391,14 @@ if [ "$need_hermes" = "1" ]; then [ -n "$H_ARCH" ] || die "archive hermes tidak 
 if [ "$need_root" = "1" ];   then [ -n "$R_ARCH" ] || die "archive root tidak ada di $TMP_ARCH"; fi
 
 # ---------------------------------------------------------------- 3. restore
-if [ -n "$H_ARCH" ]; then
+if [ -n "$H_ARCH" ] && ! skip_if_done restore-hermes; then
   say "restore HERMES + xrouter: $(basename "$H_ARCH") ($(du -h "$H_ARCH" | cut -f1))"
   cd "$TMP_ARCH"; tar -xzf "$H_ARCH" restore.sh
-  bash restore.sh "$H_ARCH"
+  bash restore.sh "$H_ARCH" || die "restore hermes gagal — ulangi: bash boot.sh --mode hermes"
+  cd /root
+  mark_done restore-hermes
 fi
-if [ -n "$R_ARCH" ]; then
+if [ -n "$R_ARCH" ] && ! skip_if_done restore-root; then
   say "restore ROOT: $(basename "$R_ARCH") ($(du -h "$R_ARCH" | cut -f1))"
   if [ -f /root/hermes-backup/restore.sh ]; then
     bash /root/hermes-backup/restore.sh "$R_ARCH"
@@ -372,19 +406,22 @@ if [ -n "$R_ARCH" ]; then
     tar -xzf "$R_ARCH" -C /
     echo "ROOT_RESTORE_OK $(basename "$R_ARCH")"
   fi
+  mark_done restore-root
 fi
 
 # ---------------------------------------------------------------- 4. tool, xrouter, jadwal
-if [ "$DO_TOOLS" = "1" ] && [ -f /root/hermes-backup/setup-tools.sh ]; then
+if [ "$DO_TOOLS" = "1" ] && [ -f /root/hermes-backup/setup-tools.sh ] && ! skip_if_done tools; then
   say "pasang tool pendukung (nvm/node, python, chrome, camoufox, venv, node_modules)"
-  bash /root/hermes-backup/setup-tools.sh || warn "ada bagian setup-tools.sh yang gagal — cek /root/hermes-backup/setup-tools.log"
+  if bash /root/hermes-backup/setup-tools.sh; then mark_done tools
+  else warn "ada bagian setup-tools.sh yang gagal — cek /root/hermes-backup/setup-tools.log (ulangi: --mode $MODE)"; fi
 fi
 
-if [ -d /opt/xrouter ]; then
-  setup_xrouter || warn "xrouter belum hidup — ulangi: bash boot.sh --fix-xrouter"
+if [ -d /opt/xrouter ] && ! skip_if_done xrouter; then
+  if setup_xrouter; then mark_done xrouter
+  else warn "xrouter belum hidup — ulangi: bash boot.sh --fix-xrouter"; fi
 fi
 
-if [ "$DO_CRON" = "1" ] && [ -f /root/hermes-backup/crontab.txt ]; then
+if [ "$DO_CRON" = "1" ] && [ -f /root/hermes-backup/crontab.txt ] && ! skip_if_done cron; then
   say "hidupkan jadwal backup (hanya baris yang targetnya ada)"
   TMPCRON="$(mktemp)"; echo "TZ=Asia/Jakarta" > "$TMPCRON"
   while IFS= read -r line; do
@@ -395,7 +432,7 @@ if [ "$DO_CRON" = "1" ] && [ -f /root/hermes-backup/crontab.txt ]; then
       *) echo "$line" >> "$TMPCRON" ;;
     esac
   done < /root/hermes-backup/crontab.txt
-  crontab "$TMPCRON" && echo "   crontab dipasang ($(grep -c '' "$TMPCRON") baris)"
+  crontab "$TMPCRON" && { echo "   crontab dipasang ($(grep -c '' "$TMPCRON") baris)"; mark_done cron; }
   rm -f "$TMPCRON"
 fi
 
