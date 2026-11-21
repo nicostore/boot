@@ -87,7 +87,20 @@ setup_xrouter() {
     else
       sed -i -E "s|^ExecStart=.*node .*custom-server.js|ExecStart=$node custom-server.js|" /etc/systemd/system/xrouter.service
       systemctl daemon-reload
-      if systemctl enable --now xrouter.service >/dev/null 2>&1; then echo "   service xrouter: aktif"; else warn "service xrouter gagal start"; fi
+      systemctl enable xrouter.service >/dev/null 2>&1 || true
+      systemctl restart xrouter.service >/dev/null 2>&1 || true
+      code=000
+      for i in $(seq 1 15); do
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:20128/api/health 2>/dev/null || echo 000)"
+        [ "$code" = "200" ] && break
+        sleep 2
+      done
+      if [ "$code" = "200" ]; then
+        echo "   service xrouter: aktif (health HTTP 200)"
+      else
+        warn "xrouter belum melayani (HTTP $code) — journalctl -u xrouter -n 40"
+        systemctl status xrouter --no-pager 2>/dev/null | head -6 | sed 's/^/      /'
+      fi
     fi
   else
     warn "unit /etc/systemd/system/xrouter.service tidak ada (archive hermes belum di-restore?)"
@@ -436,10 +449,20 @@ if [ "$DO_CRON" = "1" ] && [ -f /root/hermes-backup/crontab.txt ] && ! skip_if_d
   rm -f "$TMPCRON"
 fi
 
-if [ "$MODE" != "root" ] && command -v hermes >/dev/null; then
-  if [ "$(systemctl --user is-active hermes-gateway 2>/dev/null || true)" != "active" ]; then
-    say "start gateway Hermes"
-    systemctl --user start hermes-gateway 2>/dev/null || warn "start gagal — cek: systemctl --user status hermes-gateway"
+if [ "$MODE" != "root" ]; then
+  say "pastikan gateway Hermes jalan"
+  loginctl enable-linger root >/dev/null 2>&1 || true
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  if ! systemctl --user cat hermes-gateway >/dev/null 2>&1; then
+    warn "unit hermes-gateway belum ada — jalankan: hermes gateway install"
+  else
+    systemctl --user enable hermes-gateway >/dev/null 2>&1 || true
+    GWST="$(systemctl --user is-active hermes-gateway 2>/dev/null || true)"
+    if [ "$GWST" != "active" ]; then
+      systemctl --user start hermes-gateway >/dev/null 2>&1 || true
+      sleep 3
+    fi
+    echo "   gateway hermes: $(systemctl --user is-active hermes-gateway 2>/dev/null || echo unknown)"
   fi
 fi
 
