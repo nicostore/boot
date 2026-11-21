@@ -147,6 +147,10 @@ except Exception:
     print('   telegram bot   : tidak bisa dicek')
 " 2>/dev/null || echo "   telegram bot   : tidak bisa dicek"
   fi
+  un="$(journalctl -u xrouter --since '-5min' --no-pager 2>/dev/null | grep -c 'Failed to unseal' || true)"
+  if [ "${un:-0}" != "0" ]; then
+    echo "   peringatan     : $un error buka kredensial xrouter — apikey perlu dimasukkan ulang"
+  fi
   echo
   if [ "$gw" = "active" ]; then
     echo "   SIAP — kirim pesan ke bot Telegram kamu, sudah nyambung."
