@@ -49,14 +49,45 @@ setup_xrouter() {
   [ -d /opt/xrouter ] || { warn "/opt/xrouter tidak ada — archive hermes/root belum di-restore?"; return 0; }
   local node npm_bin
   node="$(node_bin)"
+  if [ -z "$node" ] && [ -s /root/.nvm/nvm.sh ]; then
+    # shell non-interaktif tidak membaca .bashrc -> nvm tidak otomatis aktif
+    . /root/.nvm/nvm.sh >/dev/null 2>&1 || true
+    node="$(command -v node 2>/dev/null || true)"
+  fi
+  if [ -z "$node" ] && [ -f /root/hermes-backup/setup-tools.sh ]; then
+    say "node belum ada — pasang lewat setup-tools.sh dulu"
+    bash /root/hermes-backup/setup-tools.sh >/dev/null 2>&1 || true
+    node="$(node_bin)"
+  fi
   if [ -z "$node" ]; then
-    warn "node belum ada — jalankan dulu: bash /root/hermes-backup/setup-tools.sh, lalu: boot.sh --fix-xrouter"
+    warn "node tetap tidak ada — jalankan manual: bash /root/hermes-backup/setup-tools.sh"
     return 1
   fi
   echo "   node: $node ($("$node" -v 2>/dev/null))"
 
   npm_bin="$(dirname "$node")/npm"; [ -x "$npm_bin" ] || npm_bin="$(command -v npm || true)"
   if [ -z "$npm_bin" ]; then warn "npm tidak ketemu di samping node"; return 1; fi
+
+  # Paket siap-pakai (node_modules + .next) dari Drive -> tidak perlu npm install / npm run build
+  DEPS_BUNDLE="/root/hermes-backup/out/xrouter-deps.tar.zst"
+  command -v zstd >/dev/null || { if [ "$DRY" = "1" ]; then echo "   [dry] apt-get install zstd"; else apt-get install -y -qq zstd >/dev/null 2>&1 || true; fi; }
+  if [ ! -s "$DEPS_BUNDLE" ] && [ -s "$RCLONE_CONF" ]; then
+    if [ "$DRY" = "1" ]; then
+      echo "   [dry] unduh XROUTER-DEPS.tar.zst dari Drive"
+    else
+      mkdir -p "$(dirname "$DEPS_BUNDLE")"
+      "$RCLONE" --config "$RCLONE_CONF" copy "gdrive:$HOURLY_DIR/XROUTER-DEPS.tar.zst" "$(dirname "$DEPS_BUNDLE")" >/dev/null 2>&1 || true
+    fi
+  fi
+  if [ -s "$DEPS_BUNDLE" ] && { [ ! -d /opt/xrouter/node_modules/next/dist/bin ] || [ ! -f /opt/xrouter/.next/BUILD_ID ]; }; then
+    if [ "$DRY" = "1" ]; then
+      echo "   [dry] ekstrak XROUTER-DEPS.tar.zst -> /opt/xrouter (tanpa npm install/build)"
+    elif tar -I 'zstd -d' -xf "$DEPS_BUNDLE" -C /opt/xrouter 2>/dev/null; then
+      echo "   deps: node_modules + .next dipulihkan dari paket siap-pakai"
+    else
+      warn "ekstrak paket deps gagal - jatuh ke npm install + build"
+    fi
+  fi
 
   if [ ! -d /opt/xrouter/node_modules/next/dist/bin ]; then
     if [ "$DRY" = "1" ]; then echo "   [dry] npm install (PENUH, jangan --omit=dev) di /opt/xrouter"
