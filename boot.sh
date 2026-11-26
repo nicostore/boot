@@ -310,12 +310,33 @@ hermes_present() {
 }
 
 # ---------------------------------------------------------------- 1. sistem
+# ---------------------------------------------------------------- apt tahan-lock
+# VPS baru: cloud-init / unattended-upgrades memegang lock apt selama beberapa menit.
+# Dengan set -e, satu kegagalan lock mematikan seluruh boot.sh -> tunggu + retry.
+apt_busy() { fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; }
+apt_try() {
+  local i w=0
+  for i in 1 2 3; do
+    if apt_busy; then
+      echo "   apt sedang dipakai proses lain (cloud-init/unattended-upgrades) — menunggu maks 2 menit..."
+      w=0
+      while apt_busy && [ "$w" -lt 120 ]; do sleep 3; w=$((w+3)); done
+    fi
+    "$@" -o DPkg::Lock::Timeout=180 -o Acquire::Retries=3 && return 0
+    sleep 5
+  done
+  return 1
+}
+
 if [ "$DO_APT" = "1" ] && ! skip_if_done apt; then
   say "apt update + paket dasar"
-  apt-get update -qq
-  apt-get install -y -qq curl ca-certificates unzip git jq sqlite3 python3 python3-pip \
-          openssh-client tmux >/dev/null
-  if [ "$DO_UPGRADE" = "1" ]; then say "apt upgrade"; apt-get upgrade -y -qq >/dev/null; fi
+  systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  if ! apt_try apt-get update -qq; then warn "apt update gagal (lock/jaringan) — dilanjut, paket mungkin sudah ada"; fi
+  if ! apt_try apt-get install -y -qq curl ca-certificates unzip git jq sqlite3 python3 python3-pip \
+          openssh-client tmux >/dev/null; then
+    warn "apt install gagal — dilanjut; tool yang kurang akan kelihatan di cek terakhir"
+  fi
+  if [ "$DO_UPGRADE" = "1" ]; then say "apt upgrade"; apt_try apt-get upgrade -y -qq >/dev/null || warn "apt upgrade dilewati"; fi
   mark_done apt
 fi
 
